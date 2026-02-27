@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime data / secrets
+config.yaml
+ai_monitor.db
+*.db
+logs/*.jsonl
+logs/*.log
+
+# OS
+.DS_Store

@@ -1,0 +1,41 @@
+# AI Monitor 配置示例（请复制为 config.yaml 后填写真实密钥）
+poll_interval_minutes: 10
+
+database:
+  path: ./ai_monitor.db
+
+telegram:
+  bot_token: "<YOUR_TELEGRAM_BOT_TOKEN>"
+  chat_id: "<YOUR_TELEGRAM_CHAT_ID>"
+
+llm:
+  api_key: "<YOUR_LLM_API_KEY>"
+  base_url: "https://api.minimaxi.com/v1"
+  model: "MiniMax-M2.5"
+
+tikhub:
+  api_key: "<YOUR_TIKHUB_API_KEY>"
+  base_url: "https://api.tikhub.io"
+
+http:
+  timeout: 20
+  user_agent: "ai-monitor/1.0 (+https://example.com)"
+
+sources:
+  - name: AI Twitter Monitor
+    type: tikhub_twitter
+    enabled: true
+    count: 10
+    accounts:
+      - screen_name: OpenAIDevs
+        vendor: OpenAI
+        is_founder: false
+        tier: S
+      - screen_name: GeminiApp
+        vendor: Google/Gemini
+        is_founder: false
+        tier: S
+      - screen_name: testingcatalog
+        vendor: AI快讯
+        is_founder: false
+        tier: S
