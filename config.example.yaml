@@ -13,29 +13,97 @@ llm:
   base_url: "https://api.minimaxi.com/v1"
   model: "MiniMax-M2.5"
 
-tikhub:
-  api_key: "<YOUR_TIKHUB_API_KEY>"
-  base_url: "https://api.tikhub.io"
+# TikHub 配置（暂时禁用，保留作为备用）
+# tikhub:
+#   api_key: "<YOUR_TIKHUB_API_KEY>"
+#   base_url: "https://api.tikhub.io"
+
+# Twikit 配置（用于 S/A 级账号）
+twikit:
+  cookies_path: "./cookies.json"
 
 http:
   timeout: 20
   user_agent: "ai-monitor/1.0 (+https://example.com)"
 
 sources:
-  - name: AI Twitter Monitor
-    type: tikhub_twitter
+  # S/A 级账号：使用 Twikit（免费，完整数据）
+  - name: AI Twitter Monitor (S/A Tier)
+    type: twikit_twitter
     enabled: true
     count: 10
     accounts:
+      # S 级账号
       - screen_name: OpenAIDevs
         vendor: OpenAI
+        is_founder: false
+        tier: S
+      - screen_name: OpenAI
+        vendor: OpenAI
+        is_founder: false
+        tier: S
+      - screen_name: Claudeai
+        vendor: Anthropic/Claude
         is_founder: false
         tier: S
       - screen_name: GeminiApp
         vendor: Google/Gemini
         is_founder: false
         tier: S
+
+      # A 级账号
+      - screen_name: kimmonismus
+        vendor: Kim Monismus
+        is_founder: false
+        tier: A
       - screen_name: testingcatalog
         vendor: AI快讯
         is_founder: false
-        tier: S
+        tier: A
+      - screen_name: AnthropicAI
+        vendor: Anthropic
+        is_founder: false
+        tier: A
+      - screen_name: GoogleDeepMind
+        vendor: Google DeepMind
+        is_founder: false
+        tier: A
+      - screen_name: OpenClaw
+        vendor: OpenClaw
+        is_founder: false
+        tier: A
+
+  # B 级账号：使用 Jina Reader（免费，基础数据）
+  - name: AI Twitter Monitor (B Tier)
+    type: jina_twitter
+    enabled: true
+    accounts:
+      - screen_name: Cursor
+        vendor: Cursor
+        is_founder: false
+        tier: B
+      - screen_name: perplexity_ai
+        vendor: Perplexity
+        is_founder: false
+        tier: B
+      - screen_name: Kimi_Moonshot
+        vendor: Kimi/Moonshot
+        is_founder: false
+        tier: B
+      - screen_name: MiniMax_AI
+        vendor: MiniMax
+        is_founder: false
+        tier: B
+      - screen_name: MiniMaxAgent
+        vendor: MiniMax Agent
+        is_founder: false
+        tier: B
+      - screen_name: NotionHQ
+        vendor: Notion
+        is_founder: false
+        tier: B
+      - screen_name: ManusAI
+        vendor: Manus AI
+        is_founder: false
+        tier: B
+
