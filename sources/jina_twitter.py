@@ -265,6 +265,52 @@ class JinaTwitterSource:
             logging.exception("[Jina] 拉取失败: %s", screen_name)
             return ""
 
+    @staticmethod
+    def _twitter_snowflake_to_datetime(tweet_id: str) -> Optional[datetime]:
+        """将 Twitter snowflake id 转为 UTC 时间。"""
+        try:
+            ts_ms = (int(tweet_id) >> 22) + 1288834974657
+            return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _looks_like_rt_or_quote(text: str) -> bool:
+        t = (text or "").strip().lower()
+        if t.startswith("rt @"):
+            return True
+        quote_patterns = [r"\bquote\b", r"\bquoted\b", r"\b引用\b", r"\breposted\b"]
+        return any(re.search(p, t) for p in quote_patterns)
+
+    @staticmethod
+    def _clean_tweet_text(text: str) -> str:
+        """清理 Jina markdown 中常见噪音行。"""
+        out: List[str] = []
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.lower().startswith("image:") or line.lower().startswith("videos:"):
+                continue
+            if re.match(r"^\d+\s+(retweets?|quotes?|likes?|bookmarks?)$", line, re.IGNORECASE):
+                continue
+            if re.match(r"^\d+:\d+\s+(am|pm)$", line, re.IGNORECASE):
+                continue
+            out.append(line)
+        return "\n".join(out).strip()
+
+    def _extract_tweet_time(self, tweet_id: str) -> Optional[datetime]:
+        return self._twitter_snowflake_to_datetime(tweet_id)
+
+    @staticmethod
+    def _is_within_time_window(tweet_time: datetime, last_check_time: datetime, now: datetime, max_age_hours: int = 24) -> bool:
+        if tweet_time.tzinfo is None:
+            tweet_time = tweet_time.replace(tzinfo=timezone.utc)
+        last_utc = last_check_time.astimezone(timezone.utc)
+        now_utc = now.astimezone(timezone.utc)
+        min_utc = now_utc - timedelta(hours=max_age_hours)
+        return tweet_time > last_utc and tweet_time >= min_utc
+
     def _parse_jina_markdown(self, markdown: str, screen_name: str) -> List[Dict[str, Any]]:
         """从 Jina Reader 返回的 Markdown 中解析推文"""
         tweets: List[Dict[str, Any]] = []
@@ -306,9 +352,6 @@ class JinaTwitterSource:
 
             # 收集推文文本
             if current_tweet:
-                # 跳过时间戳和统计信息行
-                if re.match(r"^\d+:\d+\s+(AM|PM)", line) or re.match(r"^\d+\s+(Retweets?|Quotes?|Likes?|Bookmarks?)", line):
-                    continue
                 if line.strip():
                     tweet_text.append(line.strip())
 
@@ -359,14 +402,53 @@ class JinaTwitterSource:
 
             tweets = self._parse_jina_markdown(markdown, screen_name)
             stats["raw"] = len(tweets)
-            stats["time_window"] = len(tweets)  # Jina 无精确时间，全部通过
+            stats["time_window"] = 0
 
             for tweet in tweets:
                 try:
                     tweet_id = tweet.get("tweet_id", "")
-                    text = tweet.get("text", "")
+                    text = self._clean_tweet_text(tweet.get("text", ""))
                     if not text or not tweet_id:
                         continue
+
+                    # 过滤 RT/Quote，避免“无关账号内容”污染
+                    if self._looks_like_rt_or_quote(text):
+                        if decision_logger:
+                            decision_logger.log(
+                                poll_id=poll_id,
+                                run_id=run_id or poll_id,
+                                account=screen_name,
+                                tweet_id=tweet_id,
+                                tier=tier,
+                                stage="time_window",
+                                decision="drop",
+                                reason_code="RT_QUOTE_FILTER",
+                                matched_rule="rt_or_quote",
+                            )
+                        continue
+
+                    # 时间窗：tweet 时间必须在 last_check_time 之后，且不早于近24小时
+                    tweet_time_utc = self._extract_tweet_time(tweet_id)
+                    if not tweet_time_utc or not self._is_within_time_window(
+                        tweet_time_utc,
+                        state.get("last_check_time", self._init_time),
+                        poll_start_time,
+                        max_age_hours=24,
+                    ):
+                        if decision_logger:
+                            decision_logger.log(
+                                poll_id=poll_id,
+                                run_id=run_id or poll_id,
+                                account=screen_name,
+                                tweet_id=tweet_id,
+                                tier=tier,
+                                stage="time_window",
+                                decision="drop",
+                                reason_code="TIME_WINDOW",
+                            )
+                        continue
+
+                    stats["time_window"] += 1
 
                     if decision_logger:
                         decision_logger.log(
@@ -461,7 +543,13 @@ class JinaTwitterSource:
                         )
 
                     url = tweet.get("url", f"https://x.com/{screen_name}/status/{tweet_id}")
-                    published_at = poll_start_time.isoformat()  # Jina 无精确时间，使用轮询时间
+
+                    # 作者一致性校验：URL 必须匹配当前监控账号
+                    if f"https://x.com/{screen_name.lower()}/status/" not in url.lower():
+                        continue
+
+                    # 使用推文真实时间（由 snowflake 推导）
+                    published_at = tweet_time_utc.astimezone(self._bj_tz).isoformat()
 
                     summary = text[:400]
                     title = text[:80] + "..." if len(text) > 80 else text
