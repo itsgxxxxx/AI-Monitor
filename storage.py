@@ -3,6 +3,7 @@ SQLite 存储层：去重 + 网页快照
 """
 import hashlib
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,12 +63,29 @@ class Storage:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
+    def _normalize_text(text: str) -> str:
+        """标准化文本，尽量减少格式差异导致的重复漏判。"""
+        normalized = (text or "").casefold()
+        normalized = normalized.replace("\u200b", " ").replace("\ufeff", " ")
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    @staticmethod
     def build_item_hash(item: NewsItem) -> str:
-        # 基于标题 + 发布日期去重（忽略 source 和 url，跨平台去重）
-        # 标准化标题：转小写，去除多余空格
-        normalized_title = " ".join(item.title.strip().lower().split())
-        raw = f"{normalized_title}|{item.published_at.strip()[:10]}"  # 只取日期部分
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        # 去重优先级：
+        # 1) dedupe_text: 来源层提供的完整正文（最准确）
+        # 2) title + summary: 兼容未提供 dedupe_text 的来源
+        # 3) url: 无文本时兜底，避免空文本全部撞哈希
+        dedupe_text = getattr(item, "dedupe_text", "")
+        normalized_text = Storage._normalize_text(dedupe_text)
+        if not normalized_text:
+            normalized_text = Storage._normalize_text(f"{item.title}\n{item.summary}")
+
+        if normalized_text:
+            payload = f"text:{normalized_text}"
+        else:
+            payload = f"url:{Storage._normalize_text(item.url)}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def save_if_new(self, item: NewsItem) -> bool:
         item_hash = self.build_item_hash(item)

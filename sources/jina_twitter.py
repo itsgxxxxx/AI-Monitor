@@ -1,7 +1,9 @@
 """
-TikHub Twitter 数据源 - 分层轮询 + 增量窗口版
+Jina Reader Twitter 数据源 - 分层轮询 + 增量窗口版
+使用 Jina Reader API 获取推文内容（适用于 B 级账号）
 """
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,13 +12,10 @@ import requests
 from storage import NewsItem
 
 
-class TikHubTwitterSource:
-    def __init__(self, cfg: Dict, api_key: str, base_url: str, user_agent: str, timeout: int):
-        self.name = cfg.get("name", "Twitter Monitor")
+class JinaTwitterSource:
+    def __init__(self, cfg: Dict, user_agent: str, timeout: int = 20):
+        self.name = cfg.get("name", "Twitter Monitor (Jina)")
         self.accounts = cfg.get("accounts", [])
-        self.count = cfg.get("count", 10)
-        self.api_key = api_key
-        self.base_url = base_url
         self.user_agent = user_agent
         self.timeout = timeout
 
@@ -27,8 +26,6 @@ class TikHubTwitterSource:
         self.vendor_map: Dict[str, Dict[str, Any]] = {}
 
         # 账号状态（用于分层调度 + 各账号独立增量窗口）
-        # key=screen_name.lower()
-        # value={tier,last_check_time,last_polled_at,no_news_streak,next_due_at}
         self.account_states: Dict[str, Dict[str, Any]] = {}
 
         for acc in self.accounts:
@@ -36,9 +33,9 @@ class TikHubTwitterSource:
             if not screen_name:
                 continue
 
-            tier = str(acc.get("tier", "A") or "A").upper()
+            tier = str(acc.get("tier", "B") or "B").upper()
             if tier not in {"S", "A", "B"}:
-                tier = "A"
+                tier = "B"
 
             lower = screen_name.lower()
             vendor = acc.get("vendor", "")
@@ -63,7 +60,6 @@ class TikHubTwitterSource:
         return hour >= 21 or hour < 3
 
     def _day_base_minutes(self, tier: str) -> int:
-        # 用户要求：B 级白天 60m 起步；其余 30m 起步
         return 60 if tier == "B" else 30
 
     def _next_interval_minutes(self, tier: str, no_news_streak: int, now: datetime) -> int:
@@ -71,29 +67,19 @@ class TikHubTwitterSource:
         分层间隔策略：
         - 夜间（21:00-03:00）：固定 15m
         - 白天（03:00-21:00）：
-          - S/A: 30 -> 60 -> 90 (max)
           - B:   60 -> 90 (max)
         """
         if self._is_night_window(now):
             return 15
 
         base = self._day_base_minutes(tier)
-        if base == 60:
-            return 60 if no_news_streak <= 0 else 90
-
-        # base=30
-        if no_news_streak <= 0:
-            return 30
-        if no_news_streak == 1:
-            return 60
-        return 90
+        return 60 if no_news_streak <= 0 else 90
 
     def _get_poll_interval(self) -> int:
         """
         主循环节拍：
         - 夜间 15m
         - 白天 30m
-        账号是否真正拉取由账号自身 due 状态决定
         """
         now = self._now_beijing()
         return (15 if self._is_night_window(now) else 30) * 60
@@ -102,7 +88,7 @@ class TikHubTwitterSource:
         lower = screen_name.lower()
         if lower not in self.account_states:
             self.account_states[lower] = {
-                "tier": "A",
+                "tier": "B",
                 "last_check_time": self._init_time,
                 "last_polled_at": None,
                 "no_news_streak": 0,
@@ -128,7 +114,7 @@ class TikHubTwitterSource:
 
     def _advance_account_schedule(self, screen_name: str, has_news: bool, now: datetime) -> None:
         state = self._get_state(screen_name)
-        tier = state.get("tier", "A")
+        tier = state.get("tier", "B")
 
         if has_news:
             state["no_news_streak"] = 0
@@ -153,7 +139,7 @@ class TikHubTwitterSource:
         """检测内容重要性并返回命中规则"""
         text_lower = text.lower()
 
-        # AI快讯账号 (testingcatalog) 特殊过滤：只发大公司相关
+        # AI快讯账号特殊过滤
         if vendor == "AI快讯":
             filter_keywords = [
                 "perplexity", "kane ai", "keep", "raycast", "alfred",
@@ -257,10 +243,6 @@ class TikHubTwitterSource:
 
         return "normal", ""
 
-    def _detect_importance(self, text: str, vendor: str = "") -> str:
-        importance, _ = self._detect_importance_with_rule(text, vendor)
-        return importance
-
     def _get_vendor(self, screen_name: str) -> str:
         info = self.vendor_map.get(screen_name.lower(), {})
         vendor = info.get("vendor", screen_name)
@@ -270,129 +252,81 @@ class TikHubTwitterSource:
             return f"{vendor} (创始人)"
         return vendor
 
-    def _parse_tweet_datetime(self, created_at: str) -> Optional[datetime]:
-        try:
-            dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
-            return dt.astimezone(self._bj_tz)
-        except Exception:
-            return None
-
-    def _is_in_window(self, tweet_time: Optional[datetime], last_check_time: datetime, now: datetime) -> bool:
-        if tweet_time is None:
-            return False
-        return last_check_time < tweet_time <= now
-
-    def _fetch_user_tweets(self, screen_name: str) -> Dict[str, Any]:
-        """拉取用户推文"""
-        url = f"{self.base_url}/api/v1/twitter/web/fetch_user_post_tweet"
-        params = {
-            "screen_name": screen_name,
-            "count": self.count,
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": self.user_agent,
-        }
+    def _fetch_profile_with_jina(self, screen_name: str) -> str:
+        """使用 Jina Reader 获取用户主页内容"""
+        url = f"https://r.jina.ai/https://x.com/{screen_name}"
+        headers = {"User-Agent": self.user_agent}
 
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=self.timeout)
+            resp = requests.get(url, headers=headers, timeout=self.timeout)
             resp.raise_for_status()
-            data = resp.json()
-            if "data" in data:
-                return data.get("data", {})
-            return {}
+            return resp.text
         except Exception:
-            logging.exception("[Twitter] 拉取失败: %s", screen_name)
-            return {}
+            logging.exception("[Jina] 拉取失败: %s", screen_name)
+            return ""
 
-    def _extract_tweets(
-        self,
-        raw_data: Dict[str, Any],
-        screen_name: str,
-        now: datetime,
-        poll_id: str,
-        run_id: str,
-        tier: str,
-        decision_logger: Any,
-    ) -> List[Dict[str, Any]]:
-        """从原始数据提取推文列表（账号级增量窗口过滤）"""
+    def _parse_jina_markdown(self, markdown: str, screen_name: str) -> List[Dict[str, Any]]:
+        """从 Jina Reader 返回的 Markdown 中解析推文"""
         tweets: List[Dict[str, Any]] = []
 
-        pinned = raw_data.get("pinned", {})
-        if pinned:
-            tweets.append(pinned)
+        # Jina Reader 返回的格式通常是：
+        # Title: @username
+        # URL Source: https://x.com/username
+        # Markdown Content:
+        #
+        # Tweet text here...
+        #
+        # [timestamp]
+        # [engagement stats]
 
-        timeline = raw_data.get("timeline", [])
-        if isinstance(timeline, list):
-            for item in timeline:
-                if isinstance(item, dict):
-                    tweets.append(item)
+        # 简单的正则匹配提取推文内容
+        # 这里需要根据实际 Jina Reader 返回格式调整
+        lines = markdown.split("\n")
+        current_tweet = None
+        tweet_text = []
 
-        state = self._get_state(screen_name)
-        last_check_time = state.get("last_check_time", self._init_time)
+        for line in lines:
+            # 检测推文 URL 模式
+            tweet_url_match = re.search(r"https://x\.com/[^/]+/status/(\d+)", line)
+            if tweet_url_match:
+                # 保存上一条推文
+                if current_tweet and tweet_text:
+                    current_tweet["text"] = "\n".join(tweet_text).strip()
+                    if current_tweet["text"]:
+                        tweets.append(current_tweet)
 
-        filtered: List[Dict[str, Any]] = []
-        dropped_window = 0
-        sampled: List[str] = []
+                # 开始新推文
+                tweet_id = tweet_url_match.group(1)
+                current_tweet = {
+                    "tweet_id": tweet_id,
+                    "url": f"https://x.com/{screen_name}/status/{tweet_id}",
+                }
+                tweet_text = []
+                continue
 
-        for t in tweets:
-            tweet_id = str(t.get("tweet_id", "unknown"))
-            created_at = t.get("created_at", "")
-            tweet_time = self._parse_tweet_datetime(created_at)
+            # 收集推文文本
+            if current_tweet:
+                # 跳过时间戳和统计信息行
+                if re.match(r"^\d+:\d+\s+(AM|PM)", line) or re.match(r"^\d+\s+(Retweets?|Quotes?|Likes?|Bookmarks?)", line):
+                    continue
+                if line.strip():
+                    tweet_text.append(line.strip())
 
-            if decision_logger:
-                decision_logger.log(
-                    poll_id=poll_id,
-                    run_id=run_id,
-                    account=screen_name,
-                    tweet_id=tweet_id,
-                    tier=tier,
-                    stage="raw",
-                    decision="pass",
-                    reason_code="RAW_FETCHED",
-                )
+        # 保存最后一条推文
+        if current_tweet and tweet_text:
+            current_tweet["text"] = "\n".join(tweet_text).strip()
+            if current_tweet["text"]:
+                tweets.append(current_tweet)
 
-            if self._is_in_window(tweet_time, last_check_time, now):
-                filtered.append(t)
-                if decision_logger:
-                    decision_logger.log(
-                        poll_id=poll_id,
-                        run_id=run_id,
-                        account=screen_name,
-                        tweet_id=tweet_id,
-                        tier=tier,
-                        stage="window",
-                        decision="pass",
-                        reason_code="WINDOW_IN_RANGE",
-                    )
-            else:
-                dropped_window += 1
-                if len(sampled) < 3:
-                    sampled.append(f"{tweet_id}@{created_at}")
-                if decision_logger:
-                    decision_logger.log(
-                        poll_id=poll_id,
-                        run_id=run_id,
-                        account=screen_name,
-                        tweet_id=tweet_id,
-                        tier=tier,
-                        stage="window",
-                        decision="drop",
-                        reason_code="WINDOW_OLD",
-                        matched_rule=created_at,
-                    )
+        return tweets
 
-        if dropped_window > 0:
-            logging.info(
-                "[%s][Twitter过滤] %s time_window drop=%s sample=%s last=%s",
-                poll_id,
-                screen_name,
-                dropped_window,
-                sampled,
-                last_check_time.isoformat(),
-            )
-
-        return filtered
+    def _is_in_window(self, last_check_time: datetime, now: datetime) -> bool:
+        """
+        Jina Reader 无法获取精确时间戳，使用简化的窗口策略：
+        - 假设所有推文都在窗口内（因为我们按固定间隔轮询）
+        - 依赖去重机制过滤重复推文
+        """
+        return True
 
     def fetch(self, poll_id: str = "", run_id: str = "", decision_logger: Any = None) -> List[NewsItem]:
         """获取所有账号的新推文"""
@@ -405,7 +339,7 @@ class TikHubTwitterSource:
                 continue
 
             state = self._get_state(screen_name)
-            tier = state.get("tier", "A")
+            tier = state.get("tier", "B")
 
             if not self._should_poll_account(screen_name, poll_start_time):
                 logging.info("[%s][Twitter调度] %s tier=%s skip (not due)", poll_id, screen_name, tier)
@@ -419,29 +353,32 @@ class TikHubTwitterSource:
                 "final": 0,
             }
 
-            raw_data = self._fetch_user_tweets(screen_name)
+            markdown = self._fetch_profile_with_jina(screen_name)
+            if not markdown:
+                continue
 
-            if raw_data.get("pinned"):
-                stats["raw"] += 1
-            stats["raw"] += len(raw_data.get("timeline", []))
-
-            tweets = self._extract_tweets(
-                raw_data,
-                screen_name,
-                poll_start_time,
-                poll_id=poll_id,
-                run_id=run_id or poll_id,
-                tier=tier,
-                decision_logger=decision_logger,
-            )
-            stats["time_window"] = len(tweets)
+            tweets = self._parse_jina_markdown(markdown, screen_name)
+            stats["raw"] = len(tweets)
+            stats["time_window"] = len(tweets)  # Jina 无精确时间，全部通过
 
             for tweet in tweets:
                 try:
-                    tweet_id = str(tweet.get("tweet_id", ""))
+                    tweet_id = tweet.get("tweet_id", "")
                     text = tweet.get("text", "")
-                    if not text:
+                    if not text or not tweet_id:
                         continue
+
+                    if decision_logger:
+                        decision_logger.log(
+                            poll_id=poll_id,
+                            run_id=run_id or poll_id,
+                            account=screen_name,
+                            tweet_id=tweet_id,
+                            tier=tier,
+                            stage="raw",
+                            decision="pass",
+                            reason_code="RAW_FETCHED",
+                        )
 
                     vendor = self._get_vendor(screen_name)
                     importance, importance_rule = self._detect_importance_with_rule(text, vendor)
@@ -523,10 +460,8 @@ class TikHubTwitterSource:
                             reason_code="NOISE_PASS",
                         )
 
-                    url = f"https://x.com/{screen_name}/status/{tweet_id}"
-                    created_at = tweet.get("created_at", "")
-                    tweet_time = self._parse_tweet_datetime(created_at)
-                    published_at = tweet_time.isoformat() if tweet_time else ""
+                    url = tweet.get("url", f"https://x.com/{screen_name}/status/{tweet_id}")
+                    published_at = poll_start_time.isoformat()  # Jina 无精确时间，使用轮询时间
 
                     summary = text[:400]
                     title = text[:80] + "..." if len(text) > 80 else text

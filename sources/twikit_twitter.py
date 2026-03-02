@@ -1,34 +1,40 @@
 """
-TikHub Twitter 数据源 - 分层轮询 + 增量窗口版
+Twikit Twitter 数据源 - 分层轮询 + 增量窗口版
+使用 twikit 库通过 cookies 认证获取推文
 """
+import asyncio
+import json
 import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+from twikit import Client
 
 from storage import NewsItem
 
 
-class TikHubTwitterSource:
-    def __init__(self, cfg: Dict, api_key: str, base_url: str, user_agent: str, timeout: int):
+class TwikitTwitterSource:
+    def __init__(self, cfg: Dict, cookies_path: str, timeout: int = 20):
         self.name = cfg.get("name", "Twitter Monitor")
         self.accounts = cfg.get("accounts", [])
         self.count = cfg.get("count", 10)
-        self.api_key = api_key
-        self.base_url = base_url
-        self.user_agent = user_agent
+        self.cookies_path = cookies_path
         self.timeout = timeout
 
         self._bj_tz = timezone(timedelta(hours=8))
         self._init_time = self._now_beijing()
 
+        # 初始化 twikit 客户端
+        self.client = Client(language="en-US")
+        self._authenticated = False
+        # 复用同一个事件循环，避免每次 asyncio.run() 造成 loop 反复关闭
+        self._loop = asyncio.new_event_loop()
+
         # 厂商映射
         self.vendor_map: Dict[str, Dict[str, Any]] = {}
 
         # 账号状态（用于分层调度 + 各账号独立增量窗口）
-        # key=screen_name.lower()
-        # value={tier,last_check_time,last_polled_at,no_news_streak,next_due_at}
         self.account_states: Dict[str, Dict[str, Any]] = {}
 
         for acc in self.accounts:
@@ -53,6 +59,34 @@ class TikHubTwitterSource:
                 "next_due_at": self._init_time,
             }
 
+    def _authenticate(self) -> bool:
+        """使用 cookies 认证"""
+        if self._authenticated:
+            return True
+
+        try:
+            cookies_file = Path(self.cookies_path)
+            if not cookies_file.exists():
+                logging.error("[Twikit] cookies 文件不存在: %s", self.cookies_path)
+                return False
+
+            with open(cookies_file, "r", encoding="utf-8") as f:
+                cookies_list = json.load(f)
+
+            # 转换 cookies 格式：从浏览器导出格式转为 dict
+            cookies_dict = {}
+            for cookie in cookies_list:
+                cookies_dict[cookie["name"]] = cookie["value"]
+
+            # 设置 cookies
+            self.client.set_cookies(cookies_dict)
+            self._authenticated = True
+            logging.info("[Twikit] 认证成功")
+            return True
+        except Exception:
+            logging.exception("[Twikit] 认证失败")
+            return False
+
     def _now_beijing(self) -> datetime:
         return datetime.now(self._bj_tz)
 
@@ -63,7 +97,6 @@ class TikHubTwitterSource:
         return hour >= 21 or hour < 3
 
     def _day_base_minutes(self, tier: str) -> int:
-        # 用户要求：B 级白天 60m 起步；其余 30m 起步
         return 60 if tier == "B" else 30
 
     def _next_interval_minutes(self, tier: str, no_news_streak: int, now: datetime) -> int:
@@ -71,7 +104,8 @@ class TikHubTwitterSource:
         分层间隔策略：
         - 夜间（21:00-03:00）：固定 15m
         - 白天（03:00-21:00）：
-          - S/A: 30 -> 60 -> 90 (max)
+          - S:   30 -> 60 (max)
+          - A:   30 -> 60 -> 90 (max)
           - B:   60 -> 90 (max)
         """
         if self._is_night_window(now):
@@ -80,6 +114,10 @@ class TikHubTwitterSource:
         base = self._day_base_minutes(tier)
         if base == 60:
             return 60 if no_news_streak <= 0 else 90
+
+        # S 级白天最长 60 分钟
+        if tier == "S":
+            return 30 if no_news_streak <= 0 else 60
 
         # base=30
         if no_news_streak <= 0:
@@ -93,7 +131,6 @@ class TikHubTwitterSource:
         主循环节拍：
         - 夜间 15m
         - 白天 30m
-        账号是否真正拉取由账号自身 due 状态决定
         """
         now = self._now_beijing()
         return (15 if self._is_night_window(now) else 30) * 60
@@ -153,7 +190,7 @@ class TikHubTwitterSource:
         """检测内容重要性并返回命中规则"""
         text_lower = text.lower()
 
-        # AI快讯账号 (testingcatalog) 特殊过滤：只发大公司相关
+        # AI快讯账号特殊过滤
         if vendor == "AI快讯":
             filter_keywords = [
                 "perplexity", "kane ai", "keep", "raycast", "alfred",
@@ -257,10 +294,6 @@ class TikHubTwitterSource:
 
         return "normal", ""
 
-    def _detect_importance(self, text: str, vendor: str = "") -> str:
-        importance, _ = self._detect_importance_with_rule(text, vendor)
-        return importance
-
     def _get_vendor(self, screen_name: str) -> str:
         info = self.vendor_map.get(screen_name.lower(), {})
         vendor = info.get("vendor", screen_name)
@@ -271,8 +304,10 @@ class TikHubTwitterSource:
         return vendor
 
     def _parse_tweet_datetime(self, created_at: str) -> Optional[datetime]:
+        """解析推文时间"""
         try:
-            dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            # twikit 返回的时间格式可能是 ISO 8601
+            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
             return dt.astimezone(self._bj_tz)
         except Exception:
             return None
@@ -282,62 +317,119 @@ class TikHubTwitterSource:
             return False
         return last_check_time < tweet_time <= now
 
-    def _fetch_user_tweets(self, screen_name: str) -> Dict[str, Any]:
-        """拉取用户推文"""
-        url = f"{self.base_url}/api/v1/twitter/web/fetch_user_post_tweet"
-        params = {
-            "screen_name": screen_name,
-            "count": self.count,
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": self.user_agent,
-        }
+    def _fetch_user_tweets(self, screen_name: str) -> List[Any]:
+        """使用 twikit 拉取用户推文（同步包装器）"""
+        if self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
 
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            if "data" in data:
-                return data.get("data", {})
-            return {}
+            asyncio.set_event_loop(self._loop)
+            return self._loop.run_until_complete(self._fetch_user_tweets_async(screen_name))
+        except RuntimeError as exc:
+            # 极端情况下 loop 状态异常，重建后重试一次
+            if "Event loop is closed" in str(exc):
+                logging.warning("[Twikit] 事件循环已关闭，重建后重试: %s", screen_name)
+                self._loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._loop)
+                return self._loop.run_until_complete(self._fetch_user_tweets_async(screen_name))
+            raise
+
+    async def _fetch_user_tweets_async(self, screen_name: str) -> List[Any]:
+        """使用 twikit 拉取用户推文（异步实现）"""
+        if not self._authenticate():
+            return []
+
+        try:
+            user = await self.client.get_user_by_screen_name(screen_name)
+            tweets = await user.get_tweets("Tweets", count=self.count)
+            return list(tweets)
         except Exception:
-            logging.exception("[Twitter] 拉取失败: %s", screen_name)
-            return {}
+            logging.exception("[Twikit] 拉取失败: %s", screen_name)
+            return []
+
+    def close(self) -> None:
+        """释放 Twikit 相关资源"""
+        try:
+            if not self._loop.is_closed():
+                # 尽量优雅关闭底层 HTTP 连接池
+                try:
+                    if hasattr(self.client, "http"):
+                        self._loop.run_until_complete(self.client.http.aclose())
+                except Exception:
+                    logging.debug("[Twikit] 关闭 HTTP 客户端时忽略异常", exc_info=True)
+                self._loop.close()
+        except Exception:
+            logging.exception("[Twikit] 关闭资源失败")
+
+    def _generate_title(self, text: str, vendor: str) -> str:
+        """生成简短的总结性标题"""
+        text_lower = text.lower()
+
+        # 提取关键产品/模型名称
+        product_patterns = [
+            r'(gpt-\d+[a-z]*)',
+            r'(claude[- ]\d+\.?\d*)',
+            r'(gemini[- ]?\d*\.?\d*[a-z]*)',
+            r'(nano banana \d+)',
+            r'(sora)',
+            r'(veo \d*)',
+            r'(codex)',
+            r'(operator)',
+            r'(o\d+[a-z]*)',
+        ]
+
+        import re
+        product_name = None
+        for pattern in product_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                product_name = match.group(1)
+                break
+
+        # 识别动作类型（按优先级排序）
+        if any(kw in text_lower for kw in ['release', 'launch', 'debut', 'announce', 'announcing', 'introducing', 'introduce', 'meet ', 'is here', 'available now', 'now available']):
+            action = '发布了'
+        elif any(kw in text_lower for kw in ['update', 'new version', 'version']):
+            action = '更新了'
+        elif any(kw in text_lower for kw in ['new feature', 'add', 'now support']):
+            action = '新增功能'
+        elif any(kw in text_lower for kw in ['fix', 'bug', 'patch']):
+            action = '修复更新'
+        else:
+            action = '更新'
+
+        # 生成标题
+        if product_name:
+            # 标准化产品名称
+            product_name = product_name.replace('-', ' ').title()
+            title = f"{product_name} {action}"
+        else:
+            # 如果没有识别到产品名，使用前30个字符
+            title = text[:30] + "..." if len(text) > 30 else text
+
+        return title
 
     def _extract_tweets(
         self,
-        raw_data: Dict[str, Any],
+        raw_tweets: List[Any],
         screen_name: str,
         now: datetime,
         poll_id: str,
         run_id: str,
         tier: str,
         decision_logger: Any,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Any]:
         """从原始数据提取推文列表（账号级增量窗口过滤）"""
-        tweets: List[Dict[str, Any]] = []
-
-        pinned = raw_data.get("pinned", {})
-        if pinned:
-            tweets.append(pinned)
-
-        timeline = raw_data.get("timeline", [])
-        if isinstance(timeline, list):
-            for item in timeline:
-                if isinstance(item, dict):
-                    tweets.append(item)
-
         state = self._get_state(screen_name)
         last_check_time = state.get("last_check_time", self._init_time)
 
-        filtered: List[Dict[str, Any]] = []
+        filtered: List[Any] = []
         dropped_window = 0
         sampled: List[str] = []
 
-        for t in tweets:
-            tweet_id = str(t.get("tweet_id", "unknown"))
-            created_at = t.get("created_at", "")
+        for tweet in raw_tweets:
+            tweet_id = str(tweet.id)
+            created_at = tweet.created_at
             tweet_time = self._parse_tweet_datetime(created_at)
 
             if decision_logger:
@@ -353,7 +445,7 @@ class TikHubTwitterSource:
                 )
 
             if self._is_in_window(tweet_time, last_check_time, now):
-                filtered.append(t)
+                filtered.append(tweet)
                 if decision_logger:
                     decision_logger.log(
                         poll_id=poll_id,
@@ -419,14 +511,11 @@ class TikHubTwitterSource:
                 "final": 0,
             }
 
-            raw_data = self._fetch_user_tweets(screen_name)
-
-            if raw_data.get("pinned"):
-                stats["raw"] += 1
-            stats["raw"] += len(raw_data.get("timeline", []))
+            raw_tweets = self._fetch_user_tweets(screen_name)
+            stats["raw"] = len(raw_tweets)
 
             tweets = self._extract_tweets(
-                raw_data,
+                raw_tweets,
                 screen_name,
                 poll_start_time,
                 poll_id=poll_id,
@@ -438,13 +527,45 @@ class TikHubTwitterSource:
 
             for tweet in tweets:
                 try:
-                    tweet_id = str(tweet.get("tweet_id", ""))
-                    text = tweet.get("text", "")
+                    tweet_id = str(tweet.id)
+                    text = tweet.text or ""
                     if not text:
                         continue
 
+                    # 检测并获取 Thread 内容
+                    is_thread = False
+                    thread_count = 0
+                    full_text = text
+
+                    if hasattr(tweet, 'replies') and tweet.replies:
+                        # 过滤出作者自己的回复
+                        author_screen_name = tweet.user.screen_name.lower()
+                        self_replies = [
+                            r for r in tweet.replies
+                            if hasattr(r, 'user') and r.user.screen_name.lower() == author_screen_name
+                        ]
+
+                        if self_replies:
+                            is_thread = True
+                            thread_count = len(self_replies)
+                            # 组合完整 Thread 文本
+                            thread_texts = [text]
+                            for reply in self_replies:
+                                if hasattr(reply, 'text') and reply.text:
+                                    thread_texts.append(reply.text)
+                            full_text = "\n\n".join(thread_texts)
+                            logging.info(
+                                "[%s][Twitter Thread] %s/%s: 检测到 Thread，包含 %d 条回复",
+                                poll_id, screen_name, tweet_id, thread_count
+                            )
+
                     vendor = self._get_vendor(screen_name)
-                    importance, importance_rule = self._detect_importance_with_rule(text, vendor)
+                    # 如果是 Thread，在 vendor 后添加标签
+                    if is_thread:
+                        vendor = f"{vendor} [Thread {thread_count+1}条]"
+
+                    # 使用完整 Thread 文本进行重要性检测
+                    importance, importance_rule = self._detect_importance_with_rule(full_text, vendor)
 
                     if importance == "filter":
                         if decision_logger:
@@ -491,7 +612,8 @@ class TikHubTwitterSource:
                             matched_rule=importance_rule,
                         )
 
-                    text_lower = text.lower()
+                    # 降噪过滤（使用完整 Thread 文本）
+                    text_lower = full_text.lower()
                     noise_keywords = ["hiring", "job ", "event", "meetup", "podcast", "welcoming"]
                     hit_noise = next((kw for kw in noise_keywords if kw in text_lower), "")
                     if hit_noise:
@@ -524,12 +646,15 @@ class TikHubTwitterSource:
                         )
 
                     url = f"https://x.com/{screen_name}/status/{tweet_id}"
-                    created_at = tweet.get("created_at", "")
+                    created_at = tweet.created_at
                     tweet_time = self._parse_tweet_datetime(created_at)
                     published_at = tweet_time.isoformat() if tweet_time else ""
 
-                    summary = text[:400]
-                    title = text[:80] + "..." if len(text) > 80 else text
+                    # 使用完整 Thread 文本生成摘要
+                    summary = full_text[:400]
+
+                    # 生成简短的总结性标题
+                    title = self._generate_title(full_text, vendor)
 
                     item = NewsItem(
                         source=f"Twitter:{screen_name}",
@@ -538,9 +663,15 @@ class TikHubTwitterSource:
                         summary=summary,
                         published_at=published_at,
                     )
-                    item.dedupe_text = text
+                    item.dedupe_text = full_text
                     item.vendor = vendor
                     item.importance = importance if importance not in ["filter", "normal"] else "minor"
+                    item.account = screen_name
+                    item.tweet_id = tweet_id
+                    item.tier = tier
+                    item.selected_reason = f"importance:{importance_rule or 'n/a'}"
+                    item.is_thread = is_thread
+                    item.thread_count = thread_count if is_thread else 0
                     item.account = screen_name
                     item.tweet_id = tweet_id
                     item.tier = tier

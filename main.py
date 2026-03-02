@@ -15,7 +15,9 @@ import yaml
 from decision_logger import DecisionLogger
 from notifiers.telegram import TelegramNotifier
 from sources.rss import RSSSource
-from sources.tikhub_twitter import TikHubTwitterSource
+# from sources.tikhub_twitter import TikHubTwitterSource  # 暂时禁用，保留作为备用
+from sources.twikit_twitter import TwikitTwitterSource
+from sources.jina_twitter import JinaTwitterSource
 from storage import NewsItem, Storage
 
 
@@ -31,10 +33,14 @@ def build_sources(cfg: Dict[str, Any]) -> List[Any]:
 
     source_clients: List[Any] = []
 
-    # 处理 TikHub Twitter 配置
-    tikhub_cfg = cfg.get("tikhub", {})
-    api_key = tikhub_cfg.get("api_key", "")
-    base_url = tikhub_cfg.get("base_url", "https://api.tikhub.io")
+    # TikHub Twitter 配置（暂时禁用）
+    # tikhub_cfg = cfg.get("tikhub", {})
+    # api_key = tikhub_cfg.get("api_key", "")
+    # base_url = tikhub_cfg.get("base_url", "https://api.tikhub.io")
+
+    # Twikit 配置（用于 S/A 级账号）
+    twikit_cfg = cfg.get("twikit", {})
+    cookies_path = twikit_cfg.get("cookies_path", "./cookies.json")
 
     for scfg in cfg.get("sources", []):
         if not scfg.get("enabled", True):
@@ -44,21 +50,41 @@ def build_sources(cfg: Dict[str, Any]) -> List[Any]:
 
         if stype == "rss":
             source_clients.append(RSSSource(scfg, user_agent=user_agent, timeout=timeout))
-        elif stype == "tikhub_twitter":
-            # TikHub Twitter 源需要特殊处理
-            if api_key:
-                scfg["accounts"] = scfg.get("accounts", [])
-                source_clients.append(
-                    TikHubTwitterSource(
-                        scfg,
-                        api_key=api_key,
-                        base_url=base_url,
-                        user_agent=user_agent,
-                        timeout=timeout,
-                    )
+        elif stype == "twikit_twitter":
+            # Twikit Twitter 源（S/A 级账号）
+            scfg["accounts"] = scfg.get("accounts", [])
+            source_clients.append(
+                TwikitTwitterSource(
+                    scfg,
+                    cookies_path=cookies_path,
+                    timeout=timeout,
                 )
-            else:
-                logging.warning("[TikHub] 缺少 API Key，跳过")
+            )
+        elif stype == "jina_twitter":
+            # Jina Reader Twitter 源（B 级账号）
+            scfg["accounts"] = scfg.get("accounts", [])
+            source_clients.append(
+                JinaTwitterSource(
+                    scfg,
+                    user_agent=user_agent,
+                    timeout=timeout,
+                )
+            )
+        # elif stype == "tikhub_twitter":
+        #     # TikHub Twitter 源（暂时禁用）
+        #     if api_key:
+        #         scfg["accounts"] = scfg.get("accounts", [])
+        #         source_clients.append(
+        #             TikHubTwitterSource(
+        #                 scfg,
+        #                 api_key=api_key,
+        #                 base_url=base_url,
+        #                 user_agent=user_agent,
+        #                 timeout=timeout,
+        #             )
+        #         )
+        #     else:
+        #         logging.warning("[TikHub] 缺少 API Key，跳过")
         else:
             logging.warning("未知数据源类型，已跳过: %s", scfg)
     return source_clients
@@ -218,7 +244,7 @@ def run_once(storage: Storage, notifier: TelegramNotifier, sources: List[Any], d
 def get_poll_interval(sources: List[Any], default_minutes: int = 10) -> int:
     """根据数据源动态计算轮询间隔"""
     for source in sources:
-        if isinstance(source, TikHubTwitterSource):
+        if isinstance(source, (TwikitTwitterSource, JinaTwitterSource)):
             return source._get_poll_interval()
     return default_minutes * 60
 
@@ -261,6 +287,13 @@ def main() -> int:
     except KeyboardInterrupt:
         logging.info("收到退出信号，程序结束。")
     finally:
+        for source in sources:
+            close_fn = getattr(source, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    logging.exception("关闭数据源失败: %s", getattr(source, "name", source))
         storage.close()
 
     return 0

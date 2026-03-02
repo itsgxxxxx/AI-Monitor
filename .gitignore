@@ -21,3 +21,4 @@ logs/*.log
 
 # OS
 .DS_Store
+cookies.json
