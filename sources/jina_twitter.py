@@ -197,12 +197,6 @@ class JinaTwitterSource:
             "slack", "notion", "github", "calendar", "youtube",
         ]
 
-        minor_update_keywords = [
-            "new skill", "new skills", "added to new skills",
-            "new capability", "improvement",
-            "enhance", "enhanced", "enhancement",
-            "voice mode", "voice", "audio mode",
-        ]
         maintenance_only_keywords = [
             "bug", "bugfix", "bug fix", "hotfix",
             "patch", "maintenance", "stability", "typo",
@@ -231,18 +225,14 @@ class JinaTwitterSource:
         ):
             return "major", "MAJOR_GLOBAL_AVAILABILITY"
 
-        # Minor: 仅在“核心产品语境”下，且有上线/可用信号时放行
-        # 避免 "notion adds ..." 这类泛化更新误推
-        has_minor_feature = any(kw in text_lower for kw in minor_update_keywords)
-        has_rollout_signal = has_release or has_capability_action or any(
-            kw in text_lower for kw in ["rolling out", "rollout", "available", "enabled", "now support", "support for"]
-        )
-        if has_core_product and has_minor_feature and has_rollout_signal:
-            return "minor", "MINOR_CORE_PRODUCT_FEATURE_ROLLOUT"
-
-        # 普通维护类更新不推送
+        # 普通维护类更新不推送（优先于 minor 判定）
         if any(kw in text_lower for kw in maintenance_only_keywords):
             return "normal", "MAINTENANCE_ONLY"
+
+        # Minor: 使用“核心产品 + 可用/上线信号”判定，避免依赖功能词清单
+        # 仅当命中核心产品语境，并出现 rollout/available/released 等上线信号时放行
+        if has_core_product and has_release:
+            return "minor", "MINOR_CORE_PRODUCT_AVAILABILITY_SIGNAL"
 
         return "normal", ""
 
