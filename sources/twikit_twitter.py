@@ -249,11 +249,10 @@ class TwikitTwitterSource:
         ]
 
         minor_update_keywords = [
-            "add ", "added ", "adds ",
             "new skill", "new skills", "added to new skills",
-            "now support", "support for",
-            "enhance", "enhanced", "enhancement",
             "new capability", "improvement",
+            "enhance", "enhanced", "enhancement",
+            "voice mode", "voice", "audio mode",
         ]
         maintenance_only_keywords = [
             "bug", "bugfix", "bug fix", "hotfix",
@@ -283,10 +282,14 @@ class TwikitTwitterSource:
         ):
             return "major", "MAJOR_GLOBAL_AVAILABILITY"
 
-        # Minor: 增量能力更新（如 add two new skills）
-        for kw in minor_update_keywords:
-            if kw in text_lower:
-                return "minor", kw
+        # Minor: 仅在“核心产品语境”下，且有上线/可用信号时放行
+        # 避免 "notion adds ..." 这类泛化更新误推
+        has_minor_feature = any(kw in text_lower for kw in minor_update_keywords)
+        has_rollout_signal = has_release or has_capability_action or any(
+            kw in text_lower for kw in ["rolling out", "rollout", "available", "enabled", "now support", "support for"]
+        )
+        if has_core_product and has_minor_feature and has_rollout_signal:
+            return "minor", "MINOR_CORE_PRODUCT_FEATURE_ROLLOUT"
 
         # 普通维护类更新不推送
         if any(kw in text_lower for kw in maintenance_only_keywords):
