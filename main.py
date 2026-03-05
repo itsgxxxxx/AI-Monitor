@@ -18,6 +18,7 @@ from sources.rss import RSSSource
 # from sources.tikhub_twitter import TikHubTwitterSource  # 暂时禁用，保留作为备用
 from sources.twikit_twitter import TwikitTwitterSource
 from sources.jina_twitter import JinaTwitterSource
+from sources.twitter_list import TwitterListSource
 from storage import NewsItem, Storage
 
 
@@ -42,6 +43,9 @@ def build_sources(cfg: Dict[str, Any]) -> List[Any]:
     twikit_cfg = cfg.get("twikit", {})
     cookies_path = twikit_cfg.get("cookies_path", "./cookies.json")
 
+    # LLM 配置（用于总结）
+    llm_cfg = cfg.get("llm", {})
+
     for scfg in cfg.get("sources", []):
         if not scfg.get("enabled", True):
             continue
@@ -50,6 +54,16 @@ def build_sources(cfg: Dict[str, Any]) -> List[Any]:
 
         if stype == "rss":
             source_clients.append(RSSSource(scfg, user_agent=user_agent, timeout=timeout))
+        elif stype == "twitter_list":
+            # Twitter List 源（推荐使用）
+            source_clients.append(
+                TwitterListSource(
+                    scfg,
+                    cookies_path=cookies_path,
+                    llm_config=llm_cfg,
+                    timeout=timeout,
+                )
+            )
         elif stype == "twikit_twitter":
             # Twikit Twitter 源（S/A 级账号）
             scfg["accounts"] = scfg.get("accounts", [])
@@ -241,9 +255,12 @@ def run_once(storage: Storage, notifier: TelegramNotifier, sources: List[Any], d
             logging.info("[%s] 本轮结束（批次失败回退逐条），新推送数量: %d", poll_id, pushed)
 
 
-def get_poll_interval(sources: List[Any], default_minutes: int = 10) -> int:
+def get_poll_interval(sources: List[Any], default_minutes: int = 30) -> int:
     """根据数据源动态计算轮询间隔"""
+    # Twitter List 固定 30 分钟轮询
     for source in sources:
+        if isinstance(source, TwitterListSource):
+            return 30 * 60
         if isinstance(source, (TwikitTwitterSource, JinaTwitterSource)):
             return source._get_poll_interval()
     return default_minutes * 60

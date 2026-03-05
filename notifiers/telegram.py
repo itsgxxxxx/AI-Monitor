@@ -164,23 +164,49 @@ class TelegramNotifier:
             return datetime.now(timezone(timedelta(hours=8))).strftime("%Y年%m月%d日 %H:%M")
 
     def _format_item(self, item: NewsItem) -> str:
-        importance = self._detect_importance(item)
-        beijing_time = self._beijing_time(item.published_at)
+        """
+        格式化推文消息
+        格式：
+        🚨（可选）标题/标签
+        监控源：@账号
+        总结：...
+        推文原文链接
+        """
+        importance = getattr(item, 'importance', None) or self._detect_importance(item)
+        category = getattr(item, 'category', None)
+        account = getattr(item, 'account', '')
+        is_thread = getattr(item, 'is_thread', False)
+        thread_count = getattr(item, 'thread_count', 0)
 
-        vendor = getattr(item, 'vendor', None) or self._extract_vendor(item)
+        # 🚨标识
+        alert_prefix = "🚨 " if importance == "critical" else ""
 
-        if hasattr(item, 'importance') and item.importance:
-            importance = item.importance
+        # 标题/标签
+        if category:
+            title_line = f"{alert_prefix}[{category}] {item.title}"
+        else:
+            vendor = getattr(item, 'vendor', None) or self._extract_vendor(item)
+            title_line = f"{alert_prefix}{vendor}: {item.title}"
 
+        # Thread 标识
+        if is_thread:
+            title_line += f" [Thread {thread_count + 1}条]"
+
+        # 监控源
+        source_line = f"监控源：@{account}" if account else f"来源：{item.source}"
+
+        # 总结
         summary = self._llm_summarize(item, importance)
-        title_prefix = "🚨 " if importance == "major" else ""
-        title_line = f"{title_prefix}{vendor}: {item.title}"
+        summary_line = f"总结：{summary}"
+
+        # 推文链接
+        link_line = f"推文原文：{item.url}"
 
         return (
             f"{title_line}\n"
-            f"北京时间: {beijing_time}\n"
-            f"{summary}\n"
-            f"原文: {item.url}"
+            f"{source_line}\n"
+            f"{summary_line}\n"
+            f"{link_line}"
         )
 
     def _send_text(self, text: str) -> bool:
@@ -192,10 +218,24 @@ class TelegramNotifier:
 
         try:
             resp = requests.post(self.endpoint, json=payload, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            if not data.get("ok", False):
-                logging.error("Telegram 返回失败: %s", data)
+            data = {}
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
+            if resp.status_code >= 400 or not data.get("ok", False):
+                desc = data.get("description", "") if isinstance(data, dict) else ""
+                if not desc:
+                    desc = (resp.text or "")[:500]
+                error_code = data.get("error_code", resp.status_code) if isinstance(data, dict) else resp.status_code
+                logging.error(
+                    "Telegram 推送失败: status=%s error_code=%s description=%s chat_id=%s",
+                    resp.status_code,
+                    error_code,
+                    desc,
+                    self.chat_id,
+                )
                 return False
             return True
         except Exception:
