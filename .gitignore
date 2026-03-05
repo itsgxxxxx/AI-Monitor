@@ -18,6 +18,7 @@ ai_monitor.db
 *.db
 logs/*.jsonl
 logs/*.log
+tools/chinese_tweets_*.txt
 
 # OS
 .DS_Store

@@ -97,6 +97,35 @@ kill $(cat logs/ai_monitor.pid)
 
 ## 配置说明
 
+## Skills
+
+### findsimilarpost（英文工具帖 -> 中文区对标检索）
+
+用于快速判断一条英文工具分享是否值得在中文群转发：
+- 自动提取项目关键词
+- 生成中文表达
+- 检索中文区高流量同项目帖子
+- 返回发送建议（`should_send`）
+
+一键安装（OpenClaw）：
+```bash
+bash -lc 'set -euo pipefail; tmp="$(mktemp -d)"; git clone --depth 1 https://github.com/itsgxxxxx/AI-Monitor.git "$tmp/repo"; bash "$tmp/repo/skills/findsimilarpost/scripts/install_openclaw.sh"; rm -rf "$tmp"'
+```
+
+调用（Agent JSON 模式）：
+```bash
+python ~/.openclaw/skills/findsimilarpost/findsimilarpost.py "https://x.com/heynavtoor/status/2028719589241307635?s=20" --agent
+```
+
+安装文档（可直接给任意 Agent）：
+- `skills/findsimilarpost/docs/install.md`
+- `https://raw.githubusercontent.com/itsgxxxxx/AI-Monitor/main/skills/findsimilarpost/docs/install.md`
+
+必需环境变量：
+```bash
+export TIKHUB_API_KEY="your_tikhub_api_key"
+```
+
 ### 账号分类
 
 在 `config.yaml` 中配置账号分类：
