@@ -65,6 +65,31 @@ python skills/findsimilarpost/findsimilarpost.py "<tweet_url>" --agent
 - `false`: 不建议直接发送（已有高流量同项目内容）
 - `null`: 暂无法判断（限流或检索错误）
 
+## 最终回复格式（必须遵守）
+
+Agent 在拿到 JSON 后，给用户的最终文字回复必须按下面格式输出，禁止只给链接列表：
+
+```text
+结论：<建议发送 / 不建议同角度直接发送 / 暂无法判断>
+理由：<decision.reason>
+
+原文中文表达：
+<source_post_cn>
+
+中文区同项目高流量帖子（最多5条）：
+1. 作者：@<screen_name>（<author>）
+   粉丝量：<followers 或 N/A>
+   点赞数：<likes 或 N/A>
+   浏览量：<views 或 N/A>
+   链接：<url>
+```
+
+硬性规则：
+- 每条结果都要包含：`作者 / 粉丝量 / 点赞数 / 浏览量 / 链接`
+- 字段缺失时填 `N/A`
+- 严禁只输出链接
+- 如果没有结果，明确写：`未找到中文区高流量同项目推荐。`
+
 ## 失败回退
 
 - 若 Jina 抓取失败但提供了 `--keyword`，脚本会继续检索。
@@ -73,4 +98,4 @@ python skills/findsimilarpost/findsimilarpost.py "<tweet_url>" --agent
 
 ## 给 Agent 的调用模板
 
-“请使用 `$findsimilarpost`。严格按 `skills/findsimilarpost/SKILL.md` 执行，运行 `python skills/findsimilarpost/findsimilarpost.py "<tweet_url>" --agent`，返回 JSON 里的 `decision` 和 `results`。”
+“请使用 `$findsimilarpost`。严格按 `skills/findsimilarpost/SKILL.md` 执行，运行 `python skills/findsimilarpost/findsimilarpost.py "<tweet_url>" --agent`。先读取 JSON，再按 SKILL.md 的‘最终回复格式（必须遵守）’输出，禁止只给链接。”

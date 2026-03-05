@@ -1,7 +1,7 @@
 interface:
   display_name: "Find Similar Post"
   short_description: "分析英文推文并检索中文区同项目高流量帖子，给出发送建议。"
-  default_prompt: "Use $findsimilarpost to analyze this tweet URL and return the send decision."
+  default_prompt: "Use $findsimilarpost, return JSON first, then summarize with author/followers/likes/views/url for each result (no links-only output)."
 
 policy:
   allow_implicit_invocation: true
